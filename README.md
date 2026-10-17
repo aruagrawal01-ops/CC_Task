@@ -46,14 +46,14 @@ Auth is simplified: every request carries `X-User-Id: <student id>`. POST endpoi
 Also: 401 missing/invalid user, 422 bad body or Idempotency-Key reused with a different body, 429 rate limit (nginx), 503 pool exhausted.
 
 ```bash
-H='-H X-User-Id:alice -H Content-Type:application/json'
+U=(-H 'X-User-Id: alice' -H 'Content-Type: application/json')   # works in bash and zsh
 curl -s localhost:8080/seats | head -c 200
-curl -s $H -H 'Idempotency-Key: r-1' -d '{"seat_id": 7}' localhost:8080/reservations
+curl -s "${U[@]}" -H 'Idempotency-Key: r-1' -d '{"seat_id": 7}' localhost:8080/reservations
 # {"id":1,"seat_id":7,"status":"held","expires_at":"...","user_id":"alice",...}
-curl -s $H -d '{"mode": "fail"}'    localhost:8080/reservations/1/pay   # 402, hold kept
-curl -s $H -d '{"mode": "success"}' localhost:8080/reservations/1/pay   # 200, status confirmed
-curl -s $H localhost:8080/users/me/bookings
-curl -s $H -X POST localhost:8080/reservations/1/cancel                # 200, seat free again
+curl -s "${U[@]}" -d '{"mode": "fail"}'    localhost:8080/reservations/1/pay   # 402, hold kept
+curl -s "${U[@]}" -d '{"mode": "success"}' localhost:8080/reservations/1/pay   # 200, status confirmed
+curl -s "${U[@]}" localhost:8080/users/me/bookings
+curl -s "${U[@]}" -X POST localhost:8080/reservations/1/cancel                # 200, seat free again
 ```
 
 ## Data model
@@ -154,22 +154,30 @@ Other rules that keep it consistent:
 
 `pytest`: 18 tests on real Postgres. They cover the happy path, 409 vs natural idempotency, failed then retried payment, lazy expiry, the sweeper, a delayed payment after expiry being voided, double pay charging once, cancel being repeatable plus reallocation, refund on cancel, a stale cancel being unable to free another user's seat, one seat per user, idempotency-key replay/mismatch, and validation. Race tests: **200 threads on one seat → exactly 1 winner**; **10,000 users on 500 seats → exactly 500 holds, all paid, 500 booked**; plus a random chaos test. After every test, `loadtest/invariants.sql` (6 queries that must return 0 rows) runs.
 
-**Locust**: 60 s, 1,000 concurrent students (spawn 100/s), each doing look → reserve → pay (65% success, 15% fail-then-retry, 10% delayed, 10% abandon, 5% cancel later). Single host (Apple M-series laptop, 10 cores), Gunicorn 4 workers × 8 threads hit directly, Postgres 14 local, no nginx.
+**Locust**: 60 s, 1,000 concurrent students (spawn 100/s). Each one looks at the map, reserves, then pays: 65% success, 15% fail-then-retry, 10% delayed, 10% abandon; 5% of buyers cancel later. Full Docker stack (`docker compose up`: nginx → 2 API replicas × 4 Gunicorn workers × 8 threads → Postgres 16), with Locust on the same machine (Apple M-series laptop, 10 cores, Docker Desktop).
 
 | Metric | Result |
 |---|---|
-| Requests | 35,827 at ~568 req/s |
-| Errors | 2 (0.01%, client-side connection resets on `GET /seats`) |
-| p50 / p95 / p99 (all) | 620 ms / 1.1 s / 1.4 s |
-| `POST /reservations` p95 | 1.1 s |
-| Final state | sold out: 453 booked + 47 held (in-flight at cutoff), 0 double bookings |
+| Requests | 62,907 at ~1,030 req/s |
+| Errors | **0** |
+| p50 / p95 / p99 (all) | 320 ms / 400 ms / 470 ms |
+| `POST /reservations` p50 / p95 | 360 ms / 410 ms |
+| `POST /reservations/{id}/pay` p95 | 3.0 s (the `delayed` mode's simulated 3 s gateway wait) |
+| Final state | sold out: 441 booked + 59 held (mid-payment at cutoff), 0 double bookings |
 | Invariants after | all 6 return 0 rows |
 
-Latency here is mostly the uncached 500-seat map that every student polls; nginx's 1 s cache on `/seats` removes that load in the Docker setup. Reproduce:
+Problems this load test found and fixed:
+- **nginx `worker_connections` defaulted to 512** → about 3.6% connection failures at 1,000 concurrent users. Raised to 4096.
+- **Occasional 502 (keep-alive race).** Gunicorn closed idle upstream sockets after 2 s while nginx reused them for 60 s. Fixed with Gunicorn `--keep-alive 75`, which is longer than nginx's 60.
+- **The pool was created lazily without a lock**, so concurrent first requests in a gthread worker each built a pool. Fixed with a lock in `db.pool()`.
+
+Without nginx (Gunicorn hit directly, no seat-map cache), the same test managed ~570 req/s with p95 1.1 s. Most of the gain comes from nginx serving the hot seat map out of its 1 s cache plus a second replica (the two weren't measured separately).
+
+Reproduce (stack running):
 
 ```bash
-locust -f loadtest/locustfile.py --headless -u 1000 -r 100 -t 60s -H http://localhost:8080
-psql lastseat -f loadtest/invariants.sql   # every result set must be empty
+locust -f loadtest/locustfile.py --headless -u 1000 -r 100 -t 60s -H http://localhost:8080 --only-summary
+docker compose exec -T db psql -U postgres lastseat < loadtest/invariants.sql   # every result set must be empty
 ```
 
 ## How it scales
@@ -186,4 +194,3 @@ psql lastseat -f loadtest/invariants.sql   # every result set must be empty
 - `X-User-Id` stands in for real auth (JWT `sub` would replace it).
 - If a process crashes between the business commit and saving the response, its idempotency key stays "in progress" (marked `shortcut:` in code). The fix is a TTL or writing the response in the same transaction.
 - A crash during a delayed payment leaves a `pending` payment row. The hold still expires normally.
-- Docker Compose and nginx config are not yet verified on a machine with Docker (load numbers above are from the non-Docker setup).
