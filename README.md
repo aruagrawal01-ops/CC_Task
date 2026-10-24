@@ -13,8 +13,22 @@ Built with Python (Flask), PostgreSQL, Gunicorn, pytest and Locust.
 | `test_app.py` | Tests, including the concurrency tests |
 | `locustfile.py` | Load test (simulates many students booking at once) |
 | `requirements.txt` | Python packages |
+| `Dockerfile` | Packages the app into a container image |
+| `docker-compose.yml` | Starts PostgreSQL and the app together with one command |
 
 ## How to run it
+
+### Option 1: with Docker (one command)
+
+You need Docker Desktop.
+
+```bash
+docker compose up --build
+```
+
+This starts PostgreSQL (and creates the tables and 500 seats from `schema.sql`) and the app on http://localhost:8000. Stop it with `docker compose down`; add `-v` to also delete the data.
+
+### Option 2: without Docker
 
 You need Python 3.10+ and PostgreSQL.
 
