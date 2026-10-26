@@ -194,5 +194,9 @@ def cancel(reservation_id):
         return jsonify(find_reservation(conn, reservation_id, user)), 200
 
 
+# Pretty-print JSON responses (easy to read in a browser) and keep keys in the order we wrote them.
+app.json.compact = False
+app.json.sort_keys = False
+
 if __name__ == "__main__":
     app.run(port=8000, threaded=True)
